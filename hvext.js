@@ -1,4 +1,9 @@
 "use strict";
+let PHYSICAL_ADDRESS_WIDTH_SUPPORTED = 48;
+let MASK_MAXPHYADDR_52_BIT = host.parseInt64(0xFFFFFFFFFFFFF);
+let MASK_1GB_PAGE = host.parseInt64(0x3FFFFFFF);
+let MASK_2MB_PAGE = host.parseInt64(0x1FFFFF);
+let MASK_12BIT = host.parseInt64(0xFFF);
 
 // Registers commands.
 function initializeScript() {
@@ -14,6 +19,8 @@ function initializeScript() {
         new host.functionAlias(eptPte, "ept_pte"),
         new host.functionAlias(indexesFor, "indexes"),
         new host.functionAlias(pte, "pte"),
+        new host.functionAlias(gvaTohpa, "gva_to_hpa"),
+        new host.functionAlias(readVmcsField, "read_vmcs"),
     ];
 }
 
@@ -125,6 +132,16 @@ function hvextHelp(command) {
             println("pte [la] - Displays contents of paging structure entries used to translated the given LA.");
             println("   la - A LA to translate with the paging structures (default= 0).");
             break;
+        case "gva_to_hpa":
+            println("gva_to_hpa [gva] - Displays contents of paging structure entries used to translated the given GVA to HPA.");
+            println("   gva - A guest virtual address");
+            println("   Usage: !gva_to_hpa 0xfffff80258e5db28");
+            break;
+        case "read_vmcs":
+            println("read_vmcs [vmcs_field] - Displays contents of the given VMCS field (encoding) value or name (case insensitive) from the current VMCS.");
+            println("   vmcs_field - A VMCS field encoding value or name (case insensitive).");
+            println("   Usage: !read_vmcs \"GUEST_CR3\" or !read_vmcs 0x6802")
+            break;
         case undefined:
         default:
             println("hvext_help [command] - Displays this message.");
@@ -137,6 +154,8 @@ function hvextHelp(command) {
             println("ept_pte [gpa] - Displays contents of EPT entries used to translated the given GPA.");
             println("indexes [address] - Displays index values to walk paging structures for the given address.");
             println("pte [la] - Displays contents of paging structure entries used to translated the given LA.");
+            println("gva_to_hpa [gva] - Displays contents of paging structure entries used to translated the given GVA to HPA.");
+            println("read_vmcs [vmcs_field] - Displays contents of the given VMCS field (encoding) value\\name from the current VMCS.");
             println("");
             println("Note: When executing some of those commands, the processor must be in VMX-root operation with an active VMCS.");
             break;
@@ -882,6 +901,158 @@ function dumpVmcs() {
         "efl=" + originalRflags);
 }
 
+// Implements the !read_vmcs command.
+function readVmcsField(input) {
+    let encoding = null;
+    let vmcs_field_name = "";
+
+    if (typeof input === "string") {
+        // println("Input name provided:", input);
+        // Assume it's a name, look up the corresponding encoding
+        for (let i = 0; i < VMCS_ENCODINGS.length; i += 2) {
+            if (VMCS_ENCODINGS[i].toLowerCase() === input.toLowerCase()) {
+                vmcs_field_name = VMCS_ENCODINGS[i];
+                encoding = VMCS_ENCODINGS[i + 1];
+                break;
+            }
+        }
+
+        if (encoding === null) {
+            println("Error: Unable to find encoding name '" + input + "'");
+            return;
+        }
+    } else if (typeof input === "number") {
+        // Handle input as an integer (could be a direct hexadecimal value)
+        encoding = input;
+
+        // Check if the encoding value exists in the VMCS_ENCODINGS array
+        let encodingExists = false;
+        for (let i = 1; i < VMCS_ENCODINGS.length; i += 2) {
+            if (VMCS_ENCODINGS[i] === encoding) {
+                vmcs_field_name = VMCS_ENCODINGS[i-1];
+                encodingExists = true;
+                break;
+            }
+        }
+
+        if (!encodingExists) {
+            println("Error: Encoding value not found.");
+            return;
+        }
+    } else {
+        println("Error: Unexpected input type. Please provide a string or a number.");
+        return;
+    }
+    
+    let value = readVmcsUnsafe(encoding);
+    if (value === undefined) {
+        println("***** FAILED *****" + " " + vmcs_field_name);
+        println(vmcs_field_name + ": ***** FAILED *****");
+    } else {
+        println(vmcs_field_name + ": " + hex(value, 16));
+    }
+}
+
+// Implements the internal version of ept_pte command. (only debug output)
+function _eptPte(gpa, pml4) {
+    if (gpa === undefined) {
+        gpa = 0;
+    }
+
+    if (pml4 === undefined) {
+        pml4 = getCurrentEptPml4();
+    }
+
+    let indexFor = indexesFor(gpa);
+    let i1 = indexFor.Pt;
+    let i2 = indexFor.Pd;
+    let i3 = indexFor.Pdpt;
+    let i4 = indexFor.Pml4;
+
+    // Pick and check PML4e.
+    let pml4e = pml4.entries[i4];
+    if (!pml4e.flags.present()) {
+        println("(ept) PML4e is not present" + hex(pml4.address.add(8 * i4)));
+        println("(ept) PML4e at " + hex(pml4.address.add(8 * i4)));
+        println("contains " + hex(pml4e.value));
+        println("pfn " + pml4e);
+        return undefined;
+    }
+
+    // Pick and check PDPTe.
+    let pdpt = pml4e.nextTable;
+    let pdpte = pdpt.entries[i3];
+    if (!pdpte.flags.present() ) {
+        println("(ept) PML4e at " + hex(pml4.address.add(8 * i4)).padEnd(18) +
+            "(ept) PDPTe (is not present) at " + hex(pdpt.address.add(8 * i3)));
+        println("contains " + hex(pml4e.value).padEnd(18) +
+            "contains " + hex(pdpte.value));
+        println("pfn " + (pml4e + "").padEnd(23) +
+            "pfn " + pdpte);
+        return undefined;
+    }
+
+    if (pdpte.flags.large) {
+        let pfn = pdpte.value
+                        .bitwiseAnd(MASK_MAXPHYADDR_52_BIT)
+                        .bitwiseShiftRight(30)
+                        .bitwiseAnd(host.parseInt64(1)
+                        .bitwiseShiftLeft(PHYSICAL_ADDRESS_WIDTH_SUPPORTED - 30)
+                        .subtract(1));
+        let pa = pfn.bitwiseShiftLeft(30);
+        let offset = gpa.bitwiseAnd(MASK_1GB_PAGE);
+        return pa.add(offset);
+    }
+
+    else{
+        // Pick and check PDe.
+        let pd = pdpte.nextTable;
+        let pde = pd.entries[i2];
+        if (!pde.flags.present()) {
+            println("(ept) PML4e at " + hex(pml4.address.add(8 * i4)).padEnd(18) +
+                "(ept) PDPTe at " + hex(pdpt.address.add(8 * i3)).padEnd(18) +
+                "(ept) PDe (is not present) at " + hex(pd.address.add(8 * i2)));
+            println("contains " + hex(pml4e.value).padEnd(18) +
+                "contains " + hex(pdpte.value).padEnd(18) +
+                "contains " + hex(pde.value));
+            println("pfn " + (pml4e + "").padEnd(23) +
+                "pfn " + (pdpte + "").padEnd(23) +
+                "pfn " + pde);
+            return undefined;
+        }
+
+        if (pde.flags.large) {
+            let pfn = pde.value
+                            .bitwiseAnd(MASK_MAXPHYADDR_52_BIT)
+                            .bitwiseShiftRight(21)
+                            .bitwiseAnd(host.parseInt64(1)
+                            .bitwiseShiftLeft(PHYSICAL_ADDRESS_WIDTH_SUPPORTED - 21)
+                            .subtract(1));
+            let pa = pfn.bitwiseShiftLeft(21);
+            let offset = gpa.bitwiseAnd(MASK_2MB_PAGE);
+            return pa.add(offset);
+        }
+        else {
+            // Pick PTe.
+            let pt = pde.nextTable;
+            let pte = pt.entries[i1];
+
+            if (!pte.flags.present()) {
+                println("(ept) pte is not present");
+                return undefined;
+            }
+            else{
+                //println("pte.pfn: " + hex(pte.pfn));
+                let pa = pte.pfn.bitwiseShiftLeft(12);
+                let offset = gpa.bitwiseAnd(MASK_12BIT);
+                //println("pa: " + hex(pa));
+                //println("GPA_TO_HPA: " + hex(pa.add(offset)));
+                return pa.add(offset);
+            }
+         }
+    }
+}
+
 // Implements the !ept_pte command.
 function eptPte(gpa, pml4) {
     if (gpa === undefined) {
@@ -1041,6 +1212,263 @@ function pte(la, pml4) {
     }
 }
 
+// Implements the internal version of pte command. (only debug output)
+function _pte(va, pml4) {
+    if (va === undefined) {
+        la = 0;
+    }
+    if (pml4 === undefined) {
+        pml4 = host.currentThread.Registers.Kernel.cr3.bitwiseAnd(~0xfff);
+    }
+
+    let indexFor = indexesFor(va);
+    let i1 = indexFor.Pt;
+    let i2 = indexFor.Pd;
+    let i3 = indexFor.Pdpt;
+    let i4 = indexFor.Pml4;
+
+    // Pick and check PML4e.
+    let pml4e = new PsEntry(readEntry(pml4 + 8 * i4));
+    if (!pml4e.flags.present()) {
+        println("PML4e is not present");
+        println("PML4e at " + hex(pml4.add(8 * i4)));
+        println("contains " + hex(pml4e.value));
+        println("pfn " + pml4e);
+        return;
+    }
+
+    // Pick and check PDPTe.
+    let pdpt = pml4e.pfn.bitwiseShiftLeft(12);
+    let pdpte = new PsEntry(readEntry(pdpt + 8 * i3));
+    if (!pdpte.flags.present()) {
+        println("PDPTe is not present");
+        println("PML4e at " + hex(pml4.add(8 * i4)).padEnd(18) +
+            "PDPTe at " + hex(pdpt.add(8 * i3)));
+        println("contains " + hex(pml4e.value).padEnd(18) +
+            "contains " + hex(pdpte.value));
+        println("pfn " + (pml4e + "").padEnd(23) +
+            "pfn " + pdpte);
+        return;
+    }
+
+    if (pdpte.flags.large) {
+        let pfn = pdpte.value
+                        .bitwiseAnd(MASK_MAXPHYADDR_52_BIT)
+                        .bitwiseShiftRight(30)
+                        .bitwiseAnd(host.parseInt64(1)
+                        .bitwiseShiftLeft(PHYSICAL_ADDRESS_WIDTH_SUPPORTED - 30)
+                        .subtract(1));
+        let pa = pfn.bitwiseShiftLeft(30);
+        let offset = va.bitwiseAnd(MASK_1GB_PAGE);
+        println("PTE_VA_TO_PA: " + hex(pa.add(offset)));
+        return pa.add(offset);
+    }
+
+    else{
+        // Pick and check PDe.
+        let pd = pdpte.pfn.bitwiseShiftLeft(12);
+        let pde = new PsEntry(readEntry(pd + 8 * i2));
+        if (!pde.flags.present()) {
+            println("PDe is not present");
+            println("PML4e at " + hex(pml4.add(8 * i4)).padEnd(18) +
+                "PDPTe at " + hex(pdpt.add(8 * i3)).padEnd(18) +
+                "PDe at " + hex(pd.add(8 * i2)));
+            println("contains " + hex(pml4e.value).padEnd(18) +
+                "contains " + hex(pdpte.value).padEnd(18) +
+                "contains " + hex(pde.value));
+            println("pfn " + (pml4e + "").padEnd(23) +
+                "pfn " + (pdpte + "").padEnd(23) +
+                "pfn " + pde);
+            return;
+        }
+
+        if (pde.flags.large) {
+            let pfn = pde.value
+                            .bitwiseAnd(MASK_MAXPHYADDR_52_BIT)
+                            .bitwiseShiftRight(21)
+                            .bitwiseAnd(host.parseInt64(1)
+                            .bitwiseShiftLeft(PHYSICAL_ADDRESS_WIDTH_SUPPORTED - 21)
+                            .subtract(1));
+            let pa = pfn.bitwiseShiftLeft(21);
+            let offset = va.bitwiseAnd(MASK_2MB_PAGE);
+            println("PTE_VA_TO_PA: " + hex(pa.add(offset)));
+            return pa.add(offset);
+        }
+        else{
+            // Pick PTe.
+            let pt = pde.pfn.bitwiseShiftLeft(12);
+            let pte = new PsEntry(readEntry(pt + 8 * i1));
+
+            if (!pte.flags.present()) {
+                println("PTe is not present");
+                println("PML4e at " + hex(pml4.add(8 * i4)).padEnd(18) +
+                "PDPTe at " + hex(pdpt.add(8 * i3)).padEnd(18) +
+                "PDe at " + hex(pd.add(8 * i2)).padEnd(20) +
+                "PTe at " + hex(pt.add(8 * i1)));
+            println("contains " + hex(pml4e.value).padEnd(18) +
+                "contains " + hex(pdpte.value).padEnd(18) +
+                "contains " + hex(pde.value).padEnd(18) +
+                "contains " + hex(pte.value));
+            println("pfn " + (pml4e + "").padEnd(23) +
+                "pfn " + (pdpte + "").padEnd(23) +
+                "pfn " + (pde + "").padEnd(23) +
+                "pfn " + pte);
+            }
+            else{
+                //println("pte.pfn: " + hex(pte.pfn));
+                let pa = pte.pfn.bitwiseShiftLeft(12);
+                let offset = va.bitwiseAnd(MASK_12BIT);
+                //println("pa: " + hex(pa));
+                println("PTE_VA_TO_PA: " + hex(pa.add(offset)));
+                return pa.add(offset);
+            }
+        }
+    }
+
+    function readEntry(address) {
+        let line = exec("!dq " + hex(address) + " l1").Last();
+        return host.parseInt64(line.replace(/`/g, "").substring(10).trim().split(" "), 16);
+    }
+}
+
+// Implements the !gva_to_hpa command.
+function gvaTohpa(gva) {
+    if (gva === undefined) {
+        println("Error: 'gva' is undefined");
+        return;
+    }
+
+    let eptp = getCurrentEptPml4();
+    let guest_cr3 = getCurrentGuestCr3();
+    
+    let guest_cr3_hpa = _eptPte(guest_cr3, eptp);
+    if (guest_cr3_hpa === undefined) {
+        // error
+        println("Error [gvaTohpa] _eptPte(guest_cr3, eptp)");
+        return;
+    }
+    else{
+        println("GUEST_CR3 (GPA, " + hex(guest_cr3) + ") to HPA: " + hex(guest_cr3_hpa));
+    }
+
+    let b_identity_mapping = (guest_cr3 == guest_cr3_hpa)
+
+    if (b_identity_mapping) {
+        println("GUEST_CR3 GPA = GUEST_CR3 HPA (identity-mapping)")
+        _pte(gva, guest_cr3_hpa);
+    }
+
+    else{
+        let indexFor = indexesFor(gva);
+        let i1 = indexFor.Pt;
+        let i2 = indexFor.Pd;
+        let i3 = indexFor.Pdpt;
+        let i4 = indexFor.Pml4;
+        
+        // read pml4e entry - GPA
+        // Pick and check PML4e.
+        let pml4e_gpa = new PsEntry(readEntry(guest_cr3_hpa + 8 * i4));
+        if (!pml4e_gpa.flags.present()) {
+            println("PML4e is not present");
+            return;
+        }
+
+        let pml4e_hpa = _eptPte(pml4e_gpa.pfn.bitwiseShiftLeft(12), eptp);
+        if (pml4e_hpa === undefined) {
+            println("Error [gvaTohpa] _eptPte(pml4e_gpa, eptp)");
+            return;
+        }
+
+        // read pdpte entry - GPA
+        // Pick and check PDPTe.
+        let pdpte_gpa = new PsEntry(readEntry(pml4e_hpa + 8 * i3));
+        if (!pdpte_gpa.flags.present()) {
+            println("PDPTe is not present");
+            return;
+        }
+
+        // handle PDPTe Large page
+        if (pdpte_gpa.flags.large) {
+            let pfn = pdpte_gpa.value
+                            .bitwiseAnd(MASK_MAXPHYADDR_52_BIT)
+                            .bitwiseShiftRight(30)
+                            .bitwiseAnd(host.parseInt64(1)
+                            .bitwiseShiftLeft(PHYSICAL_ADDRESS_WIDTH_SUPPORTED - 30)
+                            .subtract(1));
+            let pa = pfn.bitwiseShiftLeft(30);
+            let offset = gva.bitwiseAnd(MASK_1GB_PAGE);
+            let guest_gpa = pa.add(offset);
+            let host_hpa = _eptPte(guest_gpa, eptp);
+            println("GVA: " + hex(gva) + ", GPA: " + hex(guest_gpa) + ", HPA: " + hex(host_hpa));
+            return host_hpa;
+        }
+        else{
+            let pdpte_hpa = _eptPte(pdpte_gpa.pfn.bitwiseShiftLeft(12), eptp);
+            if (pdpte_hpa === undefined) {
+                println("Error [gvaTohpa] _eptPte(pdpte_gpa, eptp)");
+                return;
+            }
+
+            // read pde entry - GPA
+            // Pick and check PDEe.
+            let pde_gpa = new PsEntry(readEntry(pdpte_hpa + 8 * i2));
+            if (!pde_gpa.flags.present()) {
+                println("PDe is not present");
+                return;
+            }
+
+            // handle PDe Large page
+            if (pde_gpa.flags.large) {
+                let pfn = pde_gpa.value
+                                .bitwiseAnd(MASK_MAXPHYADDR_52_BIT)
+                                .bitwiseShiftRight(21)
+                                .bitwiseAnd(host.parseInt64(1)
+                                .bitwiseShiftLeft(PHYSICAL_ADDRESS_WIDTH_SUPPORTED - 21)
+                                .subtract(1));
+                let pa = pfn.bitwiseShiftLeft(21);
+                let offset = va.bitwiseAnd(MASK_2MB_PAGE);
+                let guest_gpa = pa.add(offset);
+                let host_hpa = _eptPte(guest_gpa, eptp);
+                println("GVA: " + hex(gva) + ", GPA: " + hex(guest_gpa) + ", HPA: " + hex(host_hpa));
+                return host_hpa;
+            }
+            else{
+                let pde_hpa = _eptPte(pde_gpa.pfn.bitwiseShiftLeft(12), eptp);
+                if (pde_hpa === undefined) {
+                    println("Error [gvaTohpa] _eptPte(pde_gpa, eptp)");
+                    return;
+                }
+
+                // read pte entry - GPA
+                // Pick and check PTe.
+                let pte_gpa = new PsEntry(readEntry(pde_hpa + 8 * i1));
+                if (!pte_gpa.flags.present()) {
+                    println("PTe is not present");
+                    return;
+                }
+
+                let pte_hpa = _eptPte(pte_gpa.pfn.bitwiseShiftLeft(12), eptp);
+                if (pte_hpa === undefined) {
+                    println("Error [gvaTohpa] _eptPte(pte_gpa, eptp)");
+                    return;
+                }
+
+                let offset = gva.bitwiseAnd(MASK_12BIT);
+                let guest_gpa = pte_hpa.add(offset);
+                let host_hpa = _eptPte(guest_gpa, eptp);
+                //println("pa: " + hex(pa));
+                println("GVA: " + hex(gva) + ", GPA: " + hex(guest_gpa) + ", HPA: " + hex(host_hpa));
+                return host_hpa;
+            }
+        }
+    }
+
+    function readEntry(address) {
+        let line = exec("!dq " + hex(address) + " l1").Last();
+        return host.parseInt64(line.replace(/`/g, "").substring(10).trim().split(" "), 16);
+    }
+}
+
 // Returns fully-parsed EPT entries pointed by the current EPTP VMCS encoding.
 function getCurrentEptPml4() {
     let exec_control1 = readVmcs(0x00004002);    // Primary processor-based VM-execution controls
@@ -1060,6 +1488,18 @@ function getCurrentEptPml4() {
 
     println("Current EPT pointer " + hex(eptp));
     return getEptPml4(eptp.bitwiseAnd(~0xfff));
+}
+
+// Returns the GUEST_CR3.
+function getCurrentGuestCr3() {
+
+    let guest_cr3 = readVmcs(0x6802);  // GUEST_CR3
+    if (guest_cr3 === undefined) {
+        throw new Error("The VMREAD instruction failed");
+    }
+
+    println("Current GUEST_CR3: " + hex(guest_cr3));
+    return guest_cr3;
 }
 
 // Returns fully-parsed EPT entries rooted from the specified address.
@@ -1334,185 +1774,182 @@ const exec = cmd => host.namespace.Debugger.Utility.Control.ExecuteCommand(cmd);
 
 // The list of VMCS encodings as of the revision 83, March 2024.
 const VMCS_ENCODINGS = [
-    "Virtual-processor identifier (VPID)", 0x00000000,
-    "Posted-interrupt notification vector", 0x00000002,
-    "EPTP index", 0x00000004,
-    "HLAT prefix size", 0x00000006,
-    "Last PID-pointer", 0x00000008,
-    "Guest ES selector", 0x00000800,
-    "Guest CS selector", 0x00000802,
-    "Guest SS selector", 0x00000804,
-    "Guest DS selector", 0x00000806,
-    "Guest FS selector", 0x00000808,
-    "Guest GS selector", 0x0000080A,
-    "Guest LDTR selector", 0x0000080C,
-    "Guest TR selector", 0x0000080E,
-    "Guest interrupt status", 0x00000810,
-    "PML index", 0x00000812,
-    "Guest UINV", 0x00000814,
-    "Host ES selector", 0x00000C00,
-    "Host CS selector", 0x00000C02,
-    "Host SS selector", 0x00000C04,
-    "Host DS selector", 0x00000C06,
-    "Host FS selector", 0x00000C08,
-    "Host GS selector", 0x00000C0A,
-    "Host TR selector", 0x00000C0C,
-    "Address of I/O bitmap A", 0x00002000,
-    "Address of I/O bitmap B", 0x00002002,
-    "Address of MSR bitmaps", 0x00002004,
-    "VM-exit MSR-store address", 0x00002006,
-    "VM-exit MSR-load address", 0x00002008,
-    "VM-entry MSR-load address", 0x0000200A,
-    "Executive-VMCS pointer", 0x0000200C,
-    "PML address", 0x0000200E,
-    "TSC offset", 0x00002010,
-    "Virtual-APIC address", 0x00002012,
-    "APIC-access address", 0x00002014,
-    "Posted-interrupt descriptor address", 0x00002016,
-    "VM-function controls", 0x00002018,
-    "EPT pointer", 0x0000201A,
-    "EOI-exit bitmap 0", 0x0000201C,
-    "EOI-exit bitmap 1", 0x0000201E,
-    "EOI-exit bitmap 2", 0x00002020,
-    "EOI-exit bitmap 3", 0x00002022,
-    "EPTP-list address", 0x00002024,
-    "VMREAD-bitmap address", 0x00002026,
-    "VMWRITE-bitmap address", 0x00002028,
-    "Virtualization-exception information address", 0x0000202A,
-    "XSS-exiting bitmap", 0x0000202C,
-    "ENCLS-exiting bitmap", 0x0000202E,
-    "Sub-page-permission-table pointer", 0x00002030,
-    "TSC multiplier", 0x00002032,
-    "Tertiary processor-based VM-execution controls", 0x00002034,
-    "ENCLV-exiting bitmap", 0x00002036,
-    "Low PASID directory address", 0x00002038,
-    "High PASID directory address", 0x0000203A,
-    "Shared EPT pointer", 0x0000203C,
-    "PCONFIG-exiting bitmap", 0x0000203E,
-    "Hypervisor-managed linear-address translation pointer", 0x00002040,
-    "PID-pointer table address", 0x00002042,
-    "Secondary VM-exit controls", 0x00002044,
-    "IA32_SPEC_CTRL mask", 0x0000204A,
-    "IA32_SPEC_CTRL shadow", 0x0000204C,
-    "Guest-physical address", 0x00002400,
-    "VMCS link pointer", 0x00002800,
-    "Guest IA32_DEBUGCTL", 0x00002802,
-    "Guest IA32_PAT", 0x00002804,
-    "Guest IA32_EFER", 0x00002806,
-    "Guest IA32_PERF_GLOBAL_CTRL", 0x00002808,
-    "Guest PDPTE0", 0x0000280A,
-    "Guest PDPTE1", 0x0000280C,
-    "Guest PDPTE2", 0x0000280E,
-    "Guest PDPTE3", 0x00002810,
-    "Guest IA32_BNDCFGS", 0x00002812,
-    "Guest IA32_RTIT_CTL", 0x00002814,
-    "Guest IA32_LBR_CTL", 0x00002816,
-    "Guest IA32_PKRS", 0x00002818,
-    "Host IA32_PAT", 0x00002C00,
-    "Host IA32_EFER", 0x00002C02,
-    "Host IA32_PERF_GLOBAL_CTRL", 0x00002C04,
-    "Host IA32_PKRS", 0x00002C06,
-    "Pin-based VM-execution controls", 0x00004000,
-    "Primary processor-based VM-execution controls", 0x00004002,
-    "Exception bitmap", 0x00004004,
-    "Page-fault error-code mask", 0x00004006,
-    "Page-fault error-code match", 0x00004008,
-    "CR3-target count", 0x0000400A,
-    "Primary VM-exit controls", 0x0000400C,
-    "VM-exit MSR-store count", 0x0000400E,
-    "VM-exit MSR-load count", 0x00004010,
-    "VM-entry controls", 0x00004012,
-    "VM-entry MSR-load count", 0x00004014,
-    "VM-entry interruption-information field", 0x00004016,
-    "VM-entry exception error code", 0x00004018,
-    "VM-entry instruction length", 0x0000401A,
-    "TPR threshold", 0x0000401C,
-    "Secondary processor-based VM-execution controls", 0x0000401E,
-    "PLE_Gap", 0x00004020,
-    "PLE_Window", 0x00004022,
-    "Instruction-timeout control", 0x00004024,
-    "VM-instruction error", 0x00004400,
-    "Exit reason", 0x00004402,
-    "VM-exit interruption information", 0x00004404,
-    "VM-exit interruption error code", 0x00004406,
-    "IDT-vectoring information field", 0x00004408,
-    "IDT-vectoring error code", 0x0000440A,
-    "VM-exit instruction length", 0x0000440C,
-    "VM-exit instruction information", 0x0000440E,
-    "Guest ES limit", 0x00004800,
-    "Guest CS limit", 0x00004802,
-    "Guest SS limit", 0x00004804,
-    "Guest DS limit", 0x00004806,
-    "Guest FS limit", 0x00004808,
-    "Guest GS limit", 0x0000480A,
-    "Guest LDTR limit", 0x0000480C,
-    "Guest TR limit", 0x0000480E,
-    "Guest GDTR limit", 0x00004810,
-    "Guest IDTR limit", 0x00004812,
-    "Guest ES access rights", 0x00004814,
-    "Guest CS access rights", 0x00004816,
-    "Guest SS access rights", 0x00004818,
-    "Guest DS access rights", 0x0000481A,
-    "Guest FS access rights", 0x0000481C,
-    "Guest GS access rights", 0x0000481E,
-    "Guest LDTR access rights", 0x00004820,
-    "Guest TR access rights", 0x00004822,
-    "Guest interruptibility state", 0x00004824,
-    "Guest activity state", 0x00004826,
-    "Guest SMBASE", 0x00004828,
-    "Guest IA32_SYSENTER_CS", 0x0000482A,
-    "VMX-preemption timer value", 0x0000482E,
-    "Host IA32_SYSENTER_CS", 0x00004C00,
-    "CR0 guest/host mask", 0x00006000,
-    "CR4 guest/host mask", 0x00006002,
-    "CR0 read shadow", 0x00006004,
-    "CR4 read shadow", 0x00006006,
-    "CR3-target value 0", 0x00006008,
-    "CR3-target value 1", 0x0000600A,
-    "CR3-target value 2", 0x0000600C,
-    "CR3-target value 3", 0x0000600E,
-    "Exit qualification", 0x00006400,
-    "I/O RCX", 0x00006402,
-    "I/O RSI", 0x00006404,
-    "I/O RDI", 0x00006406,
-    "I/O RIP", 0x00006408,
-    "Guest-linear address", 0x0000640A,
-    "Guest CR0", 0x00006800,
-    "Guest CR3", 0x00006802,
-    "Guest CR4", 0x00006804,
-    "Guest ES base", 0x00006806,
-    "Guest CS base", 0x00006808,
-    "Guest SS base", 0x0000680A,
-    "Guest DS base", 0x0000680C,
-    "Guest FS base", 0x0000680E,
-    "Guest GS base", 0x00006810,
-    "Guest LDTR base", 0x00006812,
-    "Guest TR base", 0x00006814,
-    "Guest GDTR base", 0x00006816,
-    "Guest IDTR base", 0x00006818,
-    "Guest DR7", 0x0000681A,
-    "Guest RSP", 0x0000681C,
-    "Guest RIP", 0x0000681E,
-    "Guest RFLAGS", 0x00006820,
-    "Guest pending debug exceptions", 0x00006822,
-    "Guest IA32_SYSENTER_ESP", 0x00006824,
-    "Guest IA32_SYSENTER_EIP", 0x00006826,
-    "Guest IA32_S_CET", 0x00006828,
-    "Guest SSP", 0x0000682A,
-    "Guest IA32_INTERRUPT_SSP_TABLE_ADDR", 0x0000682C,
-    "Host CR0", 0x00006C00,
-    "Host CR3", 0x00006C02,
-    "Host CR4", 0x00006C04,
-    "Host FS base", 0x00006C06,
-    "Host GS base", 0x00006C08,
-    "Host TR base", 0x00006C0A,
-    "Host GDTR base", 0x00006C0C,
-    "Host IDTR base", 0x00006C0E,
-    "Host IA32_SYSENTER_ESP", 0x00006C10,
-    "Host IA32_SYSENTER_EIP", 0x00006C12,
-    "Host RSP", 0x00006C14,
-    "Host RIP", 0x00006C16,
-    "Host IA32_S_CET", 0x00006C18,
-    "Host SSP", 0x00006C1A,
-    "Host IA32_INTERRUPT_SSP_TABLE_ADDR", 0x00006C1C,
+    "VPID", 0x0000,
+    "POSTED_INTERRUPT_NOTIFICATION_VECTOR", 0x0002,
+    "EPTP_INDEX", 0x0004,
+    "HLAT_PREFIX_SIZE", 0x0006,
+    "LAST_PID_POINTER_INDEX", 0x0008,
+    "GUEST_ES_SELECTOR", 0x0800,
+    "GUEST_CS_SELECTOR", 0x0802,
+    "GUEST_SS_SELECTOR", 0x0804,
+    "GUEST_DS_SELECTOR", 0x0806,
+    "GUEST_FS_SELECTOR", 0x0808,
+    "GUEST_GS_SELECTOR", 0x080A,
+    "GUEST_LDTR_SELECTOR", 0x080C,
+    "GUEST_TR_SELECTOR", 0x080E,
+    "GUEST_INTERRUPT_STATUS", 0x0810,
+    "GUEST_PML_INDEX", 0x0812,
+    "GUEST_UINV3", 0x0814,
+    "HOST_ES_SELECTOR", 0x0C00,
+    "HOST_CS_SELECTOR", 0x0C02,
+    "HOST_SS_SELECTOR", 0x0C04,
+    "HOST_DS_SELECTOR", 0x0C06,
+    "HOST_FS_SELECTOR", 0x0C08,
+    "HOST_GS_SELECTOR", 0x0C0A,
+    "HOST_TR_SELECTOR", 0x0C0C,
+    "ADDRESS_OF_IO_BITMAP_A", 0x2000,
+    "ADDRESS_OF_IO_BITMAP_B", 0x2002,
+    "ADDRESS_OF_MSR_BITMAPS", 0x2004,
+    "VM_EXIT_MSR_STORE_ADDR", 0x2006,
+    "VM_EXIT_MSR_LOAD_ADDR", 0x2008,
+    "VM_ENTRY_MSR_LOAD_ADDR", 0x200A,
+    "EXECUTIVE_VMCS_PTR", 0x200C,
+    "PML_ADDR", 0x200E,
+    "TSC_OFFSET", 0x2010,
+    "VIRTUAL_APIC_PAGE_ADDR", 0x2012,
+    "APIC_ACCESS_ADDR", 0x2014,
+    "PI_DESC_ADDR", 0x2016,
+    "VM_FUNCTION_CONTROL", 0x2018,
+    "EPT_POINTER", 0x201A,
+    "EOI_EXIT_BITMAP_0", 0x201C,
+    "EOI_EXIT_BITMAP_1", 0x201E,
+    "EOI_EXIT_BITMAP_2", 0x2020,
+    "EOI_EXIT_BITMAP_3", 0x2022,
+    "EPTP_LIST_ADDRESS", 0x2024,
+    "VMREAD_BITMAP_ADDRESS", 0x2026,
+    "VMWRITE_BITMAP_ADDRESS", 0x2028,
+    "VIRTUALIZATION_EXCEPTION_INFORMATION_ADDRESS", 0x202A,
+    "XSS_EXIT_BITMAP", 0x202C,
+    "ENCLS_EXITING_BITMAP", 0x202E,
+    "SUB_PAGE_PERMISSION_TABLE_POINTER", 0x2030,
+    "TSC_MULTIPLIER", 0x2032,
+    "TERTIARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS", 0x2034,
+    "ENCLV_EXITING_BITMAP", 0x2036,
+    "LOW_PASID_DIRECTORY_ADDRESS", 0x2038,
+    "HIGH_PASID_DIRECTORY_ADDRESS", 0x203A,
+    "SHARED_EPT_POINTER", 0x203C,
+    "PCONFIG_EXITING_BITMAP", 0x203E,
+    "HYPERVISOR_MANAGED_LINEAR_ADDRESS_TRANSLATION_POINTER", 0x2040,
+    "PID_POINTER_TABLE_ADDRESS", 0x2042,
+    "SECONDARY_VM_EXIT_CONTROLS", 0x2044,
+    "GUEST_PHYSICAL_ADDRESS", 0x2400,
+    "VMCS_LINK_POINTER", 0x2800,
+    "GUEST_IA32_DEBUGCTL", 0x2802,
+    "GUEST_IA32_PAT", 0x2804,
+    "GUEST_IA32_EFER", 0x2806,
+    "GUEST_IA32_PERF_GLOBAL_CTRL", 0x2808,
+    "GUEST_PDPTE0", 0x280A,
+    "GUEST_PDPTE1", 0x280C,
+    "GUEST_PDPTE2", 0x280E,
+    "GUEST_PDPTE3", 0x2810,
+    "GUEST_IA32_BNDCFGS", 0x2812,
+    "GUEST_IA32_RTIT_CTL", 0x2814,
+    "GUEST_IA32_LBR_CTL", 0x2816,
+    "GUEST_IA32_PKRS", 0x2818,
+    "HOST_IA32_PAT", 0x2C00,
+    "HOST_IA32_EFER", 0x2C02,
+    "HOST_IA32_PERF_GLOBAL_CTRL", 0x2C04,
+    "HOST_IA32_PKRS", 0x2C06,
+    "PIN_BASED_VM_EXEC_CONTROL", 0x4000,
+    "PRIMARY_PROCESSOR_BASED_VM_EXEC_CONTROL", 0x4002,
+    "EXCEPTION_BITMAP", 0x4004,
+    "PAGE_FAULT_ERROR_CODE_MASK", 0x4006,
+    "PAGE_FAULT_ERROR_CODE_MATCH", 0x4008,
+    "CR3_TARGET_COUNT", 0x400A,
+    "PRIMARY_VM_EXIT_CONTROLS", 0x400C,
+    "VM_EXIT_MSR_STORE_COUNT", 0x400E,
+    "VM_EXIT_MSR_LOAD_COUNT", 0x4010,
+    "VM_ENTRY_CONTROLS", 0x4012,
+    "VM_ENTRY_MSR_LOAD_COUNT", 0x4014,
+    "VM_ENTRY_INTR_INFO_FIELD", 0x4016,
+    "VM_ENTRY_EXCEPTION_ERROR_CODE", 0x4018,
+    "VM_ENTRY_INSTRUCTION_LEN", 0x401A,
+    "TPR_THRESHOLD", 0x401C,
+    "SECONDARY_PROCESSOR_BASED_VM_EXEC_CONTROL", 0x401E,
+    "PLE_GAP", 0x4020,
+    "PLE_WINDOW", 0x4022,
+    "VM_INSTRUCTION_ERROR", 0x4400,
+    "EXIT_REASON", 0x4402,
+    "VM_EXIT_INTERRUPTION_INFORMATION", 0x4404,
+    "VM_EXIT_INTERRUPTION_ERROR_CODE", 0x4406,
+    "IDT_VECTORING_INFORMATION", 0x4408,
+    "IDT_VECTORING_ERROR_CODE", 0x440A,
+    "VM_EXIT_INSTRUCTION_LENGTH", 0x440C,
+    "VM_EXIT_INSTRUCTION_INFO", 0x440E,
+    "GUEST_ES_LIMIT", 0x4800,
+    "GUEST_CS_LIMIT", 0x4802,
+    "GUEST_SS_LIMIT", 0x4804,
+    "GUEST_DS_LIMIT", 0x4806,
+    "GUEST_FS_LIMIT", 0x4808,
+    "GUEST_GS_LIMIT", 0x480A,
+    "GUEST_LDTR_LIMIT", 0x480C,
+    "GUEST_TR_LIMIT", 0x480E,
+    "GUEST_GDTR_LIMIT", 0x4810,
+    "GUEST_IDTR_LIMIT", 0x4812,
+    "GUEST_ES_ACCESS_RIGHTS", 0x4814,
+    "GUEST_CS_ACCESS_RIGHTS", 0x4816,
+    "GUEST_SS_ACCESS_RIGHTS", 0x4818,
+    "GUEST_DS_ACCESS_RIGHTS", 0x481A,
+    "GUEST_FS_ACCESS_RIGHTS", 0x481C,
+    "GUEST_GS_ACCESS_RIGHTS", 0x481E,
+    "GUEST_LDTR_ACCESS_RIGHTS", 0x4820,
+    "GUEST_TR_ACCESS_RIGHTS", 0x4822,
+    "GUEST_INTERRUPTIBILITY_STATE", 0x4824,
+    "GUEST_ACTIVITY_STATE", 0x4826,
+    "GUEST_SMBASE", 0x4828,
+    "GUEST_SYSENTER_CS", 0x482A,
+    "VMX_PREEMPTION_TIMER_VALUE", 0x482E,
+    "HOST_IA32_SYSENTER_CS", 0x4C00,
+    "CR0_GUEST_HOST_MASK", 0x6000,
+    "CR4_GUEST_HOST_MASK", 0x6002,
+    "CR0_READ_SHADOW", 0x6004,
+    "CR4_READ_SHADOW", 0x6006,
+    "CR3_TARGET_VALUE0", 0x6008,
+    "CR3_TARGET_VALUE1", 0x600A,
+    "CR3_TARGET_VALUE2", 0x600C,
+    "CR3_TARGET_VALUE3", 0x600E,
+    "EXIT_QUALIFICATION", 0x6400,
+    "IO_RCX", 0x6402,
+    "IO_RSI", 0x6404,
+    "IO_RDI", 0x6406,
+    "IO_RIP", 0x6408,
+    "GUEST_LINEAR_ADDRESS", 0x640A,
+    "GUEST_CR0", 0x6800,
+    "GUEST_CR3", 0x6802,
+    "GUEST_CR4", 0x6804,
+    "GUEST_ES_BASE", 0x6806,
+    "GUEST_CS_BASE", 0x6808,
+    "GUEST_SS_BASE", 0x680A,
+    "GUEST_DS_BASE", 0x680C,
+    "GUEST_FS_BASE", 0x680E,
+    "GUEST_GS_BASE", 0x6810,
+    "GUEST_LDTR_BASE", 0x6812,
+    "GUEST_TR_BASE", 0x6814,
+    "GUEST_GDTR_BASE", 0x6816,
+    "GUEST_IDTR_BASE", 0x6818,
+    "GUEST_DR7", 0x681A,
+    "GUEST_RSP", 0x681C,
+    "GUEST_RIP", 0x681E,
+    "GUEST_RFLAGS", 0x6820,
+    "GUEST_PENDING_DBG_EXCEPTIONS", 0x6822,
+    "GUEST_SYSENTER_ESP", 0x6824,
+    "GUEST_SYSENTER_EIP", 0x6826,
+    "GUEST_IA32_S_CET1", 0x6828,
+    "GUEST_SSP", 0x682A,
+    "GUEST_IA32_INTERRUPT_SSP_TABLE_ADDR", 0x682C,
+    "HOST_CR0", 0x6C00,
+    "HOST_CR3", 0x6C02,
+    "HOST_CR4", 0x6C04,
+    "HOST_FS_BASE", 0x6C06,
+    "HOST_GS_BASE", 0x6C08,
+    "HOST_TR_BASE", 0x6C0A,
+    "HOST_GDTR_BASE", 0x6C0C,
+    "HOST_IDTR_BASE", 0x6C0E,
+    "HOST_IA32_SYSENTER_ESP", 0x6C10,
+    "HOST_IA32_SYSENTER_EIP", 0x6C12,
+    "HOST_RSP", 0x6C14,
+    "HOST_RIP", 0x6C16,
+    "HOST_IA32_S_CET1", 0x6C18,
+    "HOST_SSP", 0x6C1A,
+    "HOST_IA32_INTERRUPT_SSP_TABLE_ADDR", 0x6C1C
 ];
